@@ -483,19 +483,6 @@ if st.session_state["user"] is None:
           can_edit = fresh_users[username_input]["can_edit"]
           user_projets = fresh_users[username_input].get("projets_autorises", [])
           _connecter_et_memoriser(username_input, user_role, can_edit, user_projets)
-        elif password_input == "admin2026":
-          username = username_input if username_input else "ADMIN"
-          # L'admin voit tous les projets (cf. projets_config.liste_projets_utilisateur) :
-          # la liste explicite n'est donc pas nécessaire ici, mais on la
-          # renseigne quand même pour la cohérence du jeton signé.
-          _connecter_et_memoriser(username, "admin", True, list(projets_config.PROJETS.keys()))
-        elif password_input == "ctr2026":
-          username = username_input if username_input else "USER"
-          # Mot de passe "maître" générique historique : par prudence, il ne
-          # donne accès qu'au projet d'origine, jamais automatiquement aux
-          # nouveaux projets (qui nécessitent un compte nommé explicitement
-          # autorisé, via Gestion Utilisateurs).
-          _connecter_et_memoriser(username, "user", False, [projets_config.PROJET_PAR_DEFAUT])
         else:
           st.error("❌ Nom d'utilisateur ou mot de passe incorrect.")
   st.stop()
