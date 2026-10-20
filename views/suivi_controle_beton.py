@@ -1796,11 +1796,31 @@ def show(supabase):
         st.subheader("➕ Ajouter une Nouvelle Programmation")
 
         prog_counts = {}
+        prog_counts_ref = {}   # filet de sécurité : comptage par N° de réception
         try:
-            res_deja = supabase.table("suivi_controle_beton").select("betonnage_id").eq("projet_id", projet_id_actif).execute()
-            for r in (res_deja.data or []):
-                b_id_v = r.get("betonnage_id")
-                if b_id_v: prog_counts[b_id_v] = prog_counts.get(b_id_v, 0) + 1
+            PAGE_PROG = 1000
+            debut_prog = 0
+            while True:
+                res_deja = (
+                    supabase.table("suivi_controle_beton")
+                    .select("id, betonnage_id, ref_controle")
+                    .eq("projet_id", projet_id_actif)
+                    .order("id")
+                    .range(debut_prog, debut_prog + PAGE_PROG - 1)
+                    .execute()
+                )
+                lignes_prog = res_deja.data or []
+                for r in lignes_prog:
+                    b_id_v = r.get("betonnage_id")
+                    if b_id_v:
+                        prog_counts[b_id_v] = prog_counts.get(b_id_v, 0) + 1
+                    else:
+                        ref_v = str(r.get("ref_controle") or "").strip()
+                        if ref_v:
+                            prog_counts_ref[ref_v] = prog_counts_ref.get(ref_v, 0) + 1
+                if len(lignes_prog) < PAGE_PROG:
+                    break
+                debut_prog += PAGE_PROG
         except Exception as e:
             st.warning(f"Note lors du contrôle des quotas : {e}")
 
@@ -1811,7 +1831,8 @@ def show(supabase):
                 fiches_sans_num_reception.append(b)
                 continue
             total_prevu = int(b.get("nb_eprouvettes") or 12)
-            if (total_prevu - prog_counts.get(b.get("id"), 0)) > 0 or mode_admin:
+            deja_prog_b = prog_counts.get(b.get("id"), 0) + prog_counts_ref.get(num_rec, 0)
+            if (total_prevu - deja_prog_b) > 0 or mode_admin:
                 betonnages_non_programmes.append(b)
 
         if fiches_sans_num_reception:
@@ -1830,7 +1851,7 @@ def show(supabase):
             num_bl_p = extraire_num_bl(beton_p, choix_label_p)
             ouvrage_p, classe_beton_p = str(beton_p.get("ouvrage") or "-"), str(beton_p.get("classe_beton") or "-")
             total_eprouvettes_prevues = int(beton_p.get("nb_eprouvettes") or 12)
-            eprouvettes_deja_prog = prog_counts.get(b_id, 0)
+            eprouvettes_deja_prog = prog_counts.get(b_id, 0) + prog_counts_ref.get(str(num_reception_p or "").strip(), 0)
             solde_disponible = max(0, total_eprouvettes_prevues - eprouvettes_deja_prog)
 
             date_coulee_raw = extraire_date_coulee(beton_p)
