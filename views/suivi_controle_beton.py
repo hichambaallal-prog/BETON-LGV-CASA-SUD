@@ -1789,6 +1789,102 @@ def show(supabase):
                             if nb_suppr > 0:
                                 st.success(f"✅ {nb_suppr} éprouvette(s) supprimée(s).")
                                 st.rerun()
+
+            # --- Détection et nettoyage des doublons de programmation ---
+            with st.expander("🧹 Détecter et supprimer les doublons de programmation", expanded=False):
+                st.caption(
+                    "Repère les éprouvettes programmées plusieurs fois pour le même lot, la même échéance"
+                    " et le même repère (ex : B/571 programmé 3 fois). Pour chaque groupe, la ligne qui"
+                    " a déjà un résultat (sinon la plus ancienne) est conservée ; les autres sont proposées à la suppression."
+                )
+                if st.button("🔍 Rechercher les doublons", key="btn_scan_doublons_prog"):
+                    toutes_lignes_dbl, debut_dbl = [], 0
+                    try:
+                        while True:
+                            res_dbl = (
+                                supabase.table("suivi_controle_beton").select("*")
+                                .eq("projet_id", projet_id_actif).order("id")
+                                .range(debut_dbl, debut_dbl + 999).execute()
+                            )
+                            lot_dbl = res_dbl.data or []
+                            toutes_lignes_dbl.extend(lot_dbl)
+                            if len(lot_dbl) < 1000:
+                                break
+                            debut_dbl += 1000
+                    except Exception as e_dbl:
+                        st.error(f"Erreur de chargement : {e_dbl}")
+                        toutes_lignes_dbl = []
+
+                    groupes_dbl = {}
+                    for ep_d in toutes_lignes_dbl:
+                        cle_d = (
+                            str(ep_d.get("betonnage_id") or ep_d.get("ref_controle") or "").strip(),
+                            str(ep_d.get("echeance") or "").strip(),
+                            str(ep_d.get("repere_eprouvette") or "").strip(),
+                        )
+                        groupes_dbl.setdefault(cle_d, []).append(ep_d)
+
+                    a_supprimer_dbl = []
+                    for cle_d, lignes_d in groupes_dbl.items():
+                        if len(lignes_d) < 2:
+                            continue
+                        def _prio(e):
+                            fk = e.get("force_kn")
+                            a_resultat = 0 if (fk not in (None, 0, 0.0)) else 1
+                            return (a_resultat, e.get("id") or 0)
+                        lignes_d_tri = sorted(lignes_d, key=_prio)
+                        for extra in lignes_d_tri[1:]:
+                            if extra.get("force_kn") not in (None, 0, 0.0):
+                                continue  # ne jamais proposer de supprimer une ligne avec résultat
+                            a_supprimer_dbl.append(extra)
+                    st.session_state["doublons_prog_a_supprimer"] = a_supprimer_dbl
+
+                a_supprimer_dbl = st.session_state.get("doublons_prog_a_supprimer")
+                if a_supprimer_dbl is not None:
+                    if not a_supprimer_dbl:
+                        st.success("✅ Aucun doublon détecté.")
+                    else:
+                        st.warning(f"⚠️ {len(a_supprimer_dbl)} doublon(s) détecté(s) :")
+                        st.dataframe(
+                            pd.DataFrame([
+                                {
+                                    "ID": e.get("id"),
+                                    "Réf. Contrôle": e.get("ref_controle"),
+                                    "Repère": e.get("repere_eprouvette"),
+                                    "Échéance": e.get("echeance"),
+                                    "Date écrasement": e.get("date_ecrasement"),
+                                }
+                                for e in a_supprimer_dbl
+                            ]),
+                            use_container_width=True, hide_index=True,
+                        )
+                        confirmer_dbl = st.checkbox(
+                            "Je confirme la suppression définitive de ces doublons",
+                            key="confirm_suppr_doublons_prog",
+                        )
+                        if st.button(
+                            "🗑️ Supprimer tous les doublons listés", type="primary",
+                            disabled=not confirmer_dbl, key="btn_suppr_doublons_prog",
+                        ):
+                            nb_dbl = 0
+                            for e in a_supprimer_dbl:
+                                try:
+                                    supabase.table("suivi_controle_beton").delete().eq("id", e["id"]).execute()
+                                    enregistrer_modification(
+                                        supabase,
+                                        table_concernee="suivi_controle_beton",
+                                        enregistrement_id=e["id"],
+                                        action="SUPPRESSION",
+                                        anciennes_valeurs={k: v for k, v in e.items() if k != "id"},
+                                        commentaire="Suppression d'un doublon de programmation (Phase 1)",
+                                    )
+                                    nb_dbl += 1
+                                except Exception as err_dbl:
+                                    st.error(f"Erreur suppression #{e.get('id')} : {err_dbl}")
+                            st.session_state.pop("doublons_prog_a_supprimer", None)
+                            if nb_dbl:
+                                st.success(f"✅ {nb_dbl} doublon(s) supprimé(s).")
+                                st.rerun()
         else:
             st.info("🔒 **Accès restreint :** La modification nécessite le droit `can_edit`.")
 
