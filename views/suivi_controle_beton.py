@@ -12,6 +12,23 @@ import streamlit.components.v1 as components
 import qrcode
 from audit_log import enregistrer_modification, afficher_historique_modifications
 import projets_config
+from types import SimpleNamespace
+
+
+def fetch_all(build_query, page_size=1000):
+    """Lit TOUTES les lignes d'une requête Supabase en paginant (limite serveur = 1000 lignes
+    par requête). `build_query` est une fonction sans argument qui retourne la requête
+    SANS .execute(), ex : fetch_all(lambda: supabase.table("t").select("*").order("id"))
+    Retourne un objet avec .data, comme .execute()."""
+    toutes, debut = [], 0
+    while True:
+        res = build_query().range(debut, debut + page_size - 1).execute()
+        lot = res.data or []
+        toutes.extend(lot)
+        if len(lot) < page_size:
+            break
+        debut += page_size
+    return SimpleNamespace(data=toutes)
 
 try:
     from supabase import create_client, Client
@@ -627,7 +644,7 @@ def obtenir_infos_betonnage_parents_bulk(supabase, betonnage_ids):
     if not ids_valides:
         return {}
     try:
-        res = supabase.table("suivi_betonnage").select("*").in_("id", ids_valides).execute()
+        res = fetch_all(lambda: supabase.table("suivi_betonnage").select("*").in_("id", ids_valides))
         return {p["id"]: p for p in (res.data or [])}
     except Exception as e:
         st.warning(f"Note : Impossible de charger les fiches parentes en lot : {e}")
@@ -740,7 +757,7 @@ def afficher_module_validation_admin(supabase, est_admin=False):
         st.info("👁️ **Mode consultation** : cette phase est ouverte aux utilisateurs connectés. La validation officielle, le rejet, la signature et la modification des résultats sont réservés à l'administrateur BAALLAL.")
 
     try:
-        res = supabase.table("suivi_controle_beton").select("*").eq("projet_id", projet_id_actif).not_.is_("force_kn", "null").gt("force_kn", 0).order("id", desc=True).execute()
+        res = fetch_all(lambda: supabase.table("suivi_controle_beton").select("*").eq("projet_id", projet_id_actif).not_.is_("force_kn", "null").gt("force_kn", 0).order("id", desc=True))
         essais_realises = res.data or []
     except Exception as e:
         st.error(f"❌ Erreur de chargement des essais réalisés : {e}")
@@ -1213,7 +1230,7 @@ def show(supabase):
 
     betonnages_preleves = []
     try:
-        res_b = supabase.table("suivi_betonnage").select("*").eq("projet_id", projet_id_actif).order("id", desc=True).execute()
+        res_b = fetch_all(lambda: supabase.table("suivi_betonnage").select("*").eq("projet_id", projet_id_actif).order("id", desc=True))
         if res_b.data:
             betonnages_preleves = [b for b in res_b.data if b.get("prelevement") and str(b.get("prelevement")).upper().startswith("OUI")]
     except Exception as e:
@@ -1433,7 +1450,7 @@ def show(supabase):
                 )
                 if st.button("🔧 Recalculer et corriger toutes les dates d'écrasement", key="btn_fix_toutes_dates_ecrasement"):
                     try:
-                        res_fix = supabase.table("suivi_controle_beton").select("*").eq("projet_id", projet_id_actif).execute()
+                        res_fix = fetch_all(lambda: supabase.table("suivi_controle_beton").select("*").eq("projet_id", projet_id_actif).order("id"))
                         toutes_eprouvettes = res_fix.data or []
                     except Exception as e:
                         toutes_eprouvettes = []
@@ -1487,7 +1504,7 @@ def show(supabase):
                 )
                 if st.button("🔧 Recalculer et corriger toutes les références de contrôle", key="btn_fix_toutes_ref_controle"):
                     try:
-                        res_fix_ref = supabase.table("suivi_controle_beton").select("*").eq("projet_id", projet_id_actif).execute()
+                        res_fix_ref = fetch_all(lambda: supabase.table("suivi_controle_beton").select("*").eq("projet_id", projet_id_actif).order("id"))
                         toutes_eprouvettes_ref = res_fix_ref.data or []
                     except Exception as e:
                         toutes_eprouvettes_ref = []
@@ -1532,7 +1549,7 @@ def show(supabase):
 
             with st.expander("✏️ Modification / Ajustement d'une Programmation Existante", expanded=False):
                 try:
-                    res_p = supabase.table("suivi_controle_beton").select("*").eq("projet_id", projet_id_actif).order("id", desc=True).execute()
+                    res_p = fetch_all(lambda: supabase.table("suivi_controle_beton").select("*").eq("projet_id", projet_id_actif).order("id", desc=True))
                     eprouvettes_enregistrees = res_p.data or []
                 except Exception as e:
                     eprouvettes_enregistrees = []
@@ -2067,7 +2084,7 @@ def show(supabase):
 
         # Retards
         try:
-            res_retards = supabase.table("suivi_controle_beton").select("*").eq("projet_id", projet_id_actif).lte("date_ecrasement", today_str).or_("force_kn.is.null,force_kn.eq.0").order("date_ecrasement", desc=False).execute()
+            res_retards = fetch_all(lambda: supabase.table("suivi_controle_beton").select("*").eq("projet_id", projet_id_actif).lte("date_ecrasement", today_str).or_("force_kn.is.null,force_kn.eq.0").order("date_ecrasement", desc=False).order("id"))
             retards_list = res_retards.data or []
         except Exception as e:
             retards_list = []
@@ -2090,8 +2107,8 @@ def show(supabase):
 
         # Jour et Semaine
         try:
-            eprouvettes_date_sel = supabase.table("suivi_controle_beton").select("*").eq("projet_id", projet_id_actif).eq("date_ecrasement", date_filtre_str).order("id", desc=False).execute().data or []
-            eprouvettes_semaine = supabase.table("suivi_controle_beton").select("*").eq("projet_id", projet_id_actif).gte("date_ecrasement", str(debut_semaine)).lte("date_ecrasement", str(fin_semaine)).order("date_ecrasement", desc=False).execute().data or []
+            eprouvettes_date_sel = fetch_all(lambda: supabase.table("suivi_controle_beton").select("*").eq("projet_id", projet_id_actif).eq("date_ecrasement", date_filtre_str).order("id", desc=False).order("id")).data or []
+            eprouvettes_semaine = fetch_all(lambda: supabase.table("suivi_controle_beton").select("*").eq("projet_id", projet_id_actif).gte("date_ecrasement", str(debut_semaine)).lte("date_ecrasement", str(fin_semaine)).order("date_ecrasement", desc=False).order("id")).data or []
         except Exception as e:
             eprouvettes_date_sel, eprouvettes_semaine = [], []
             st.warning(f"Note chargement planning : {e}")
@@ -2116,7 +2133,7 @@ def show(supabase):
 
         try:
             if mode_admin:
-                res_att = supabase.table("suivi_controle_beton").select("*").eq("projet_id", projet_id_actif).order("id", desc=False).execute()
+                res_att = fetch_all(lambda: supabase.table("suivi_controle_beton").select("*").eq("projet_id", projet_id_actif).order("id", desc=False))
                 eprouvettes_en_attente = res_att.data or []
             else:
                 res_att = (
