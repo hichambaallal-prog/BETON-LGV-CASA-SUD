@@ -1593,40 +1593,16 @@ def show(supabase):
                     if "type_essai" in df_display_prog.columns:
                         df_display_prog["type_essai"] = df_display_prog["type_essai"].fillna("Compression")
 
-                    # --- Aperçu live : "Date Écrasement Prévue" = Date Coulée + Échéance ---
-                    # On applique d'abord les éditions non-encore-enregistrées de
-                    # l'utilisateur (stockées par Streamlit dans session_state sous
-                    # la clé du data_editor) avant de recalculer, pour que la date
-                    # affichée se mette à jour DÈS qu'on change l'échéance dans le
-                    # tableau — sans attendre le clic sur "Enregistrer".
-                    etat_editeur_prog = st.session_state.get("editor_modification_phase1", {})
-                    edited_rows_prog = etat_editeur_prog.get("edited_rows", {})
-                    lignes_avec_date_manuelle = set()
-                    for idx_pos, changements in edited_rows_prog.items():
-                        idx_pos = int(idx_pos)
-                        if idx_pos < len(df_display_prog):
-                            for col_maj, val_maj in changements.items():
-                                if col_maj in df_display_prog.columns:
-                                    df_display_prog.iat[idx_pos, df_display_prog.columns.get_loc(col_maj)] = val_maj
-                            if "date_ecrasement" in changements:
-                                # L'utilisateur a directement modifié cette date : on la
-                                # respecte, on ne doit pas l'écraser par l'auto-calcul
-                                # ci-dessous.
-                                lignes_avec_date_manuelle.add(idx_pos)
-
-                    if "date_ecrasement" in df_display_prog.columns and "date_coulee" in df_display_prog.columns:
-                        col_idx_ecras = df_display_prog.columns.get_loc("date_ecrasement")
-                        for idx_pos in range(len(df_display_prog)):
-                            if idx_pos in lignes_avec_date_manuelle:
-                                continue
-                            ech_val = df_display_prog.iloc[idx_pos].get("echeance")
-                            coulee_val = df_display_prog.iloc[idx_pos].get("date_coulee")
-                            nb_j_apercu = extraire_nb_jours(ech_val, default=28)
-                            try:
-                                dt_c_apercu = datetime.strptime(str(coulee_val)[:10], "%Y-%m-%d").date()
-                                df_display_prog.iat[idx_pos, col_idx_ecras] = str(dt_c_apercu + timedelta(days=nb_j_apercu))
-                            except (ValueError, TypeError):
-                                pass  # Date Coulée invalide/absente : on laisse la valeur enregistrée telle quelle
+                    # NB : le tableau reçoit TOUJOURS les données brutes de la base (jamais
+                    # modifiées pendant la saisie). Modifier les données passées à st.data_editor
+                    # fait réinitialiser le tableau et annule les changements de l'utilisateur
+                    # (ex : 90 jours qui revient à 28 jours). Le recalcul de la date d'écrasement
+                    # se fait donc au moment de l'enregistrement.
+                    st.caption(
+                        "💡 Si vous changez l'**Échéance Visée**, la **Date Écrasement Prévue** est"
+                        " recalculée automatiquement (Date Coulée + Échéance) à l'enregistrement,"
+                        " sauf si vous modifiez cette date vous-même."
+                    )
 
                     df_prog_modifiee = st.data_editor(
                         df_display_prog,
@@ -1679,22 +1655,24 @@ def show(supabase):
                                 ech_str = str(r_m.get("echeance", "")).strip()
                                 dt_coulee_str = str(r_m.get("date_coulee", "")).strip()
 
-                                # La colonne "date_ecrasement" affichée dans le tableau
-                                # reflète déjà soit le calcul automatique (Date Coulée +
-                                # Échéance), soit une correction manuelle directe de
-                                # l'utilisateur (cf. logique d'aperçu ci-dessus qui
-                                # respecte les deux cas) : on enregistre donc cette
-                                # valeur telle quelle, sans la recalculer ici — la
-                                # recalculer aurait pour effet d'écraser silencieusement
-                                # toute correction manuelle de la date d'écrasement.
-                                dt_ecrasement_val = str(r_m.get("date_ecrasement", "")).strip()
-                                if not dt_ecrasement_val or dt_ecrasement_val.lower() in ["none", "nan", "-", ""]:
+                                # Recalcul de la date d'écrasement : si l'utilisateur n'a PAS
+                                # modifié lui-même la date, mais a changé l'échéance (ou la date
+                                # de coulée), on la recalcule = Date Coulée + Échéance.
+                                # Si l'utilisateur a saisi une date à la main, on la conserve.
+                                orig_ligne = orig_par_id_p1.get(ep_id, {})
+                                ech_orig = str(orig_ligne.get("echeance") or "").strip()
+                                coulee_orig = str(orig_ligne.get("date_coulee") or "").strip()
+                                ecras_orig = str(orig_ligne.get("date_ecrasement") or "").strip()
+                                dt_ecrasement_val = str(r_m.get("date_ecrasement", "") or "").strip()
+                                date_saisie_manuellement = dt_ecrasement_val != ecras_orig
+                                vide = (not dt_ecrasement_val) or dt_ecrasement_val.lower() in ["none", "nan", "-", "nat"]
+                                if vide or (not date_saisie_manuellement and (ech_str != ech_orig or dt_coulee_str != coulee_orig)):
                                     nb_j = extraire_nb_jours(ech_str, default=28)
                                     try:
                                         dt_c = datetime.strptime(dt_coulee_str[:10], "%Y-%m-%d").date()
                                         dt_ecrasement_val = str(dt_c + timedelta(days=nb_j))
                                     except (ValueError, TypeError):
-                                        dt_ecrasement_val = dt_coulee_str
+                                        dt_ecrasement_val = dt_coulee_str if vide else dt_ecrasement_val
 
                                 pay = {
                                     "ref_controle": ref_ctrl,
