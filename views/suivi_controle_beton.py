@@ -1710,16 +1710,27 @@ def show(supabase):
 
                         if st.button("💾 Enregistrer les Modifications de Programmation", type="primary", use_container_width=True, key="btn_save_mod_prog"):
                             bloque_mod = False
+                            orig_par_id_p1 = {ep["id"]: ep for ep in eprouvettes_enregistrees}
+                            refs_deja_verifiees = set()
                             for _, r_m in df_prog_modifiee.iterrows():
                                 ref_ctrl = str(r_m.get("ref_controle", "")).strip()
-                                if ref_ctrl and verifier_doublon_num_reception(supabase, ref_ctrl, current_beton_id=r_m.get("betonnage_id"), projet_id=projet_id_actif):
+                                ref_orig_chk = str((orig_par_id_p1.get(int(r_m["id"]), {}) or {}).get("ref_controle") or "").strip()
+                                # PERFORMANCE : on ne vérifie que les références réellement modifiées
+                                # (avant : 1 requête par ligne du tableau, même sans changement).
+                                if not ref_ctrl or ref_ctrl == ref_orig_chk:
+                                    continue
+                                cle_chk = (ref_ctrl, r_m.get("betonnage_id"))
+                                if cle_chk in refs_deja_verifiees:
+                                    continue
+                                refs_deja_verifiees.add(cle_chk)
+                                if verifier_doublon_num_reception(supabase, ref_ctrl, current_beton_id=r_m.get("betonnage_id"), projet_id=projet_id_actif):
                                     st.error(f"❌ **Modification Bloquée** : La Réf `{ref_ctrl}` existe déjà !")
                                     bloque_mod = True
                                     break
 
                             if not bloque_mod:
-                                orig_par_id_p1 = {ep["id"]: ep for ep in eprouvettes_enregistrees}
                                 nb_succes = 0
+                                nb_inchanges = 0
                                 for _, r_m in df_prog_modifiee.iterrows():
                                     ep_id, b_id = int(r_m["id"]), r_m.get("betonnage_id")
                                     ref_ctrl = str(r_m.get("ref_controle", "")).strip()
@@ -1754,6 +1765,21 @@ def show(supabase):
                                         "type_essai": str(r_m.get("type_essai", "") or "Compression").strip(),
                                         "forme": str(r_m.get("forme", "") or "Cylindrique 150x300").strip(),
                                     }
+                                    # PERFORMANCE : on saute les lignes qui n'ont pas changé
+                                    # (avant : toutes les lignes du tableau étaient réécrites,
+                                    # avec 3 requêtes par ligne => plusieurs minutes).
+                                    orig_cmp = orig_par_id_p1.get(ep_id, {}) or {}
+                                    def _norm_cmp(v, defaut=""):
+                                        t = str(v).strip() if v is not None else ""
+                                        return defaut if t.lower() in ["", "none", "nan", "nat"] else t
+                                    ligne_modifiee = any(
+                                        _norm_cmp(pay[k], ("Compression" if k == "type_essai" else "Cylindrique 150x300" if k == "forme" else ""))
+                                        != _norm_cmp(orig_cmp.get(k), ("Compression" if k == "type_essai" else "Cylindrique 150x300" if k == "forme" else ""))
+                                        for k in pay
+                                    )
+                                    if not ligne_modifiee:
+                                        nb_inchanges += 1
+                                        continue
                                     try:
                                         orig_row_p1 = orig_par_id_p1.get(ep_id, {})
                                         supabase.table("suivi_controle_beton").update(pay).eq("id", ep_id).execute()
@@ -1766,7 +1792,7 @@ def show(supabase):
                                             nouvelles_valeurs=pay,
                                             commentaire="Ajustement de programmation (Phase 1)",
                                         )
-                                        if b_id:
+                                        if b_id and _norm_cmp(ref_ctrl) != _norm_cmp(orig_cmp.get("ref_controle")):
                                             try: supabase.table("suivi_betonnage").update({"num_reception": ref_ctrl}).eq("id", b_id).execute()
                                             except Exception: pass
                                         nb_succes += 1
@@ -1775,6 +1801,8 @@ def show(supabase):
                                 if nb_succes > 0:
                                     st.success(f"✅ {nb_succes} programmation(s) mise(s) à jour avec recalcul automatique de la date d'écrasement !")
                                     st.rerun()
+                                elif nb_inchanges > 0:
+                                    st.info("ℹ️ Aucune modification détectée : rien à enregistrer.")
 
                         st.markdown("---")
                         st.markdown("##### 🗑️ Supprimer une ou plusieurs éprouvettes programmées par erreur")
