@@ -47,6 +47,70 @@ OPTIONS_ONGLETS = [
 # ==============================================================================
 # FONCTIONS UTILITAIRES : EXTRACTION DE DATES ET DÉLAIS (DAP-PANDAS & REGEX)
 # ==============================================================================
+# ---------------------------------------------------------------------------
+# PERFORMANCE : suivi des écritures + lectures en cache
+# Toute écriture (insert/update/delete/upsert/rpc) passe par un "proxy" qui
+# incrémente un numéro de version global. Les lectures en cache dépendent de ce
+# numéro : dès qu'une donnée est modifiée, le cache est ignoré et les données
+# sont relues. Sinon, elles sont servies instantanément.
+# ---------------------------------------------------------------------------
+@st.cache_resource
+def _version_donnees():
+    return {"v": 0}
+
+
+def _bump_version():
+    _version_donnees()["v"] += 1
+
+
+_METHODES_ECRITURE = {"insert", "update", "delete", "upsert", "rpc"}
+
+
+class _ProxyRequete:
+    def __init__(self, req, ecriture=False):
+        self._req = req
+        self._ecriture = ecriture
+
+    def execute(self, *a, **k):
+        res = self._req.execute(*a, **k)
+        if self._ecriture:
+            _bump_version()
+        return res
+
+    def __getattr__(self, nom):
+        attr = getattr(self._req, nom)
+        ecr = self._ecriture or nom in _METHODES_ECRITURE
+        if callable(attr):
+            def _appel(*a, **k):
+                r = attr(*a, **k)
+                return _ProxyRequete(r, ecr) if hasattr(r, "execute") else r
+            return _appel
+        return _ProxyRequete(attr, ecr) if hasattr(attr, "execute") else attr
+
+
+class _ProxySupabase:
+    def __init__(self, client):
+        self._client = client
+
+    def table(self, nom):
+        return _ProxyRequete(self._client.table(nom))
+
+    def rpc(self, *a, **k):
+        return _ProxyRequete(self._client.rpc(*a, **k), True)
+
+    def __getattr__(self, nom):
+        return getattr(self._client, nom)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def lire_table_projet(_sb, table, projet_id, version, colonnes="*", desc=True):
+    """Lecture complète (paginée) d'une table pour un projet, mise en cache.
+    `version` change à chaque écriture => relecture automatique."""
+    return fetch_all(
+        lambda: _sb.table(table).select(colonnes).eq("projet_id", projet_id).order("id", desc=desc)
+    ).data
+
+
 def calculer_date_ecrasement(df):
     """
     Calcule la 'Date Écrasement Prévue' à partir de 'Date Coulée'
@@ -644,7 +708,7 @@ def obtenir_infos_betonnage_parents_bulk(supabase, betonnage_ids):
     if not ids_valides:
         return {}
     try:
-        res = fetch_all(lambda: supabase.table("suivi_betonnage").select("*").in_("id", ids_valides))
+        res = fetch_all(lambda: supabase.table("suivi_betonnage").select("*").in_("id", ids_valides).order("id"))
         return {p["id"]: p for p in (res.data or [])}
     except Exception as e:
         st.warning(f"Note : Impossible de charger les fiches parentes en lot : {e}")
@@ -1162,6 +1226,8 @@ def afficher_module_validation_admin(supabase, est_admin=False):
 # 3. APPLICATION PRINCIPALE STREAMLIT
 # =========================================================
 def show(supabase):
+    if not isinstance(supabase, _ProxySupabase):
+        supabase = _ProxySupabase(supabase)
     st.title("🧪 Contrôle & Écrasement du Béton (NF EN 12390)")
 
     st.session_state.setdefault("phase_actuelle", OPTIONS_ONGLETS[0])
@@ -1230,9 +1296,9 @@ def show(supabase):
 
     betonnages_preleves = []
     try:
-        res_b = fetch_all(lambda: supabase.table("suivi_betonnage").select("*").eq("projet_id", projet_id_actif).order("id", desc=True))
-        if res_b.data:
-            betonnages_preleves = [b for b in res_b.data if b.get("prelevement") and str(b.get("prelevement")).upper().startswith("OUI")]
+        data_b = lire_table_projet(supabase, "suivi_betonnage", projet_id_actif, _version_donnees()["v"])
+        if data_b:
+            betonnages_preleves = [b for b in data_b if b.get("prelevement") and str(b.get("prelevement")).upper().startswith("OUI")]
     except Exception as e:
         st.error(f"❌ Erreur lors du chargement des bétonnages : {e}")
 
@@ -1548,242 +1614,247 @@ def show(supabase):
                         st.info("👍 Toutes les références de contrôle étaient déjà cohérentes.")
 
             with st.expander("✏️ Modification / Ajustement d'une Programmation Existante", expanded=False):
-                try:
-                    res_p = fetch_all(lambda: supabase.table("suivi_controle_beton").select("*").eq("projet_id", projet_id_actif).order("id", desc=True))
-                    eprouvettes_enregistrees = res_p.data or []
-                except Exception as e:
-                    eprouvettes_enregistrees = []
-                    st.error(f"Erreur lors du chargement des programmations : {e}")
+                charger_tab_prog = st.checkbox(
+                    "📂 Charger le tableau des programmations (modifier / supprimer)",
+                    value=False, key="charger_tab_prog_mod",
+                    help="Décoché par défaut pour garder l'application rapide.",
+                )
+                if charger_tab_prog:
+                    try:
+                        eprouvettes_enregistrees = lire_table_projet(supabase, "suivi_controle_beton", projet_id_actif, _version_donnees()["v"]) or []
+                    except Exception as e:
+                        eprouvettes_enregistrees = []
+                        st.error(f"Erreur lors du chargement des programmations : {e}")
 
-                if eprouvettes_enregistrees:
-                    dates_corrigees_count = 0
-                    for ep in eprouvettes_enregistrees:
-                        parent_beton = map_betonnages.get(ep.get("betonnage_id"))
-                        if parent_beton:
-                            date_coulee_correcte = extraire_date_coulee(parent_beton)
-                            dt_coulee_ep = str(ep.get("date_coulee") or "").strip()
+                    if eprouvettes_enregistrees:
+                        dates_corrigees_count = 0
+                        for ep in eprouvettes_enregistrees:
+                            parent_beton = map_betonnages.get(ep.get("betonnage_id"))
+                            if parent_beton:
+                                date_coulee_correcte = extraire_date_coulee(parent_beton)
+                                dt_coulee_ep = str(ep.get("date_coulee") or "").strip()
                             
-                            # Synchronisation automatique
-                            if dt_coulee_ep != date_coulee_correcte:
-                                ep["date_coulee"] = date_coulee_correcte
-                                nb_j = extraire_nb_jours(ep.get("echeance"), default=28)
+                                # Synchronisation automatique
+                                if dt_coulee_ep != date_coulee_correcte:
+                                    ep["date_coulee"] = date_coulee_correcte
+                                    nb_j = extraire_nb_jours(ep.get("echeance"), default=28)
                                 
-                                try:
-                                    dt_c = datetime.strptime(date_coulee_correcte[:10], "%Y-%m-%d").date()
-                                    nouvelle_date_ecrasement = str(dt_c + timedelta(days=nb_j))
-                                    ep["date_ecrasement"] = nouvelle_date_ecrasement
-                                except Exception:
-                                    nouvelle_date_ecrasement = ep.get("date_ecrasement")
-
-                                try:
-                                    supabase.table("suivi_controle_beton").update({
-                                        "date_coulee": date_coulee_correcte,
-                                        "date_ecrasement": nouvelle_date_ecrasement
-                                    }).eq("id", ep["id"]).execute()
-                                    dates_corrigees_count += 1
-                                except Exception:
-                                    pass
-
-                    if dates_corrigees_count > 0:
-                        st.success(f"🔄 **Synchronisation effectuée** : {dates_corrigees_count} date(s) de coulée réalignée(s) sur la Phase 0 !")
-
-                    df_edit_prog = pd.DataFrame(eprouvettes_enregistrees)
-                    cols_ed = [c for c in ["id", "betonnage_id", "ref_controle", "repere_eprouvette", "echeance", "date_ecrasement", "date_coulee", "ouvrage", "classe_beton", "type_essai", "forme"] if c in df_edit_prog.columns]
-                    df_display_prog = df_edit_prog[cols_ed].copy()
-                    if "type_essai" in df_display_prog.columns:
-                        df_display_prog["type_essai"] = df_display_prog["type_essai"].fillna("Compression")
-
-                    # NB : le tableau reçoit TOUJOURS les données brutes de la base (jamais
-                    # modifiées pendant la saisie). Modifier les données passées à st.data_editor
-                    # fait réinitialiser le tableau et annule les changements de l'utilisateur
-                    # (ex : 90 jours qui revient à 28 jours). Le recalcul de la date d'écrasement
-                    # se fait donc au moment de l'enregistrement.
-                    st.caption(
-                        "💡 Si vous changez l'**Échéance Visée**, la **Date Écrasement Prévue** est"
-                        " recalculée automatiquement (Date Coulée + Échéance) à l'enregistrement,"
-                        " sauf si vous modifiez cette date vous-même."
-                    )
-
-                    df_prog_modifiee = st.data_editor(
-                        df_display_prog,
-                        column_config={
-                            "id": st.column_config.NumberColumn("ID", disabled=True),
-                            "betonnage_id": None,
-                            "ref_controle": st.column_config.TextColumn("Réf. Contrôle (N° Réception)"),
-                            "echeance": st.column_config.SelectboxColumn("Échéance Visée", options=["3 jours", "7 jours", "28 jours", "90 jours"]),
-                            "date_coulee": st.column_config.TextColumn("Date Coulée"),
-                            "date_ecrasement": st.column_config.TextColumn(
-                                "Date Écrasement Prévue",
-                                help="Calculée automatiquement = Date Coulée + Échéance"
-                                     " Visée, mais modifiable directement si besoin (ex :"
-                                     " décalage logistique, jour férié). Une valeur saisie"
-                                     " ici manuellement est conservée telle quelle tant que"
-                                     " l'Échéance ou la Date Coulée de cette ligne ne"
-                                     " changent pas à leur tour.",
-                            ),
-                            "ouvrage": st.column_config.TextColumn("Ouvrage", disabled=True),
-                            "classe_beton": st.column_config.TextColumn("Classe Béton", disabled=True),
-                            "type_essai": st.column_config.SelectboxColumn(
-                                "🧪 Type d'essai",
-                                options=["Compression", "Traction par fendage"],
-                                help="Détermine la formule utilisée pour calculer la"
-                                     " résistance à la saisie des résultats.",
-                            ),
-                            "forme": st.column_config.SelectboxColumn(
-                                "Forme d'éprouvette",
-                                options=["Cylindrique 150x300", "Cylindrique 160x320", "Cylindrique 100x200"],
-                            ),
-                        },
-                        use_container_width=True, hide_index=True, key="editor_modification_phase1",
-                    )
-
-                    if st.button("💾 Enregistrer les Modifications de Programmation", type="primary", use_container_width=True, key="btn_save_mod_prog"):
-                        bloque_mod = False
-                        for _, r_m in df_prog_modifiee.iterrows():
-                            ref_ctrl = str(r_m.get("ref_controle", "")).strip()
-                            if ref_ctrl and verifier_doublon_num_reception(supabase, ref_ctrl, current_beton_id=r_m.get("betonnage_id"), projet_id=projet_id_actif):
-                                st.error(f"❌ **Modification Bloquée** : La Réf `{ref_ctrl}` existe déjà !")
-                                bloque_mod = True
-                                break
-
-                        if not bloque_mod:
-                            orig_par_id_p1 = {ep["id"]: ep for ep in eprouvettes_enregistrees}
-                            nb_succes = 0
-                            for _, r_m in df_prog_modifiee.iterrows():
-                                ep_id, b_id = int(r_m["id"]), r_m.get("betonnage_id")
-                                ref_ctrl = str(r_m.get("ref_controle", "")).strip()
-                                ech_str = str(r_m.get("echeance", "")).strip()
-                                dt_coulee_str = str(r_m.get("date_coulee", "")).strip()
-
-                                # Recalcul de la date d'écrasement : si l'utilisateur n'a PAS
-                                # modifié lui-même la date, mais a changé l'échéance (ou la date
-                                # de coulée), on la recalcule = Date Coulée + Échéance.
-                                # Si l'utilisateur a saisi une date à la main, on la conserve.
-                                orig_ligne = orig_par_id_p1.get(ep_id, {})
-                                ech_orig = str(orig_ligne.get("echeance") or "").strip()
-                                coulee_orig = str(orig_ligne.get("date_coulee") or "").strip()
-                                ecras_orig = str(orig_ligne.get("date_ecrasement") or "").strip()
-                                dt_ecrasement_val = str(r_m.get("date_ecrasement", "") or "").strip()
-                                date_saisie_manuellement = dt_ecrasement_val != ecras_orig
-                                vide = (not dt_ecrasement_val) or dt_ecrasement_val.lower() in ["none", "nan", "-", "nat"]
-                                if vide or (not date_saisie_manuellement and (ech_str != ech_orig or dt_coulee_str != coulee_orig)):
-                                    nb_j = extraire_nb_jours(ech_str, default=28)
                                     try:
-                                        dt_c = datetime.strptime(dt_coulee_str[:10], "%Y-%m-%d").date()
-                                        dt_ecrasement_val = str(dt_c + timedelta(days=nb_j))
-                                    except (ValueError, TypeError):
-                                        dt_ecrasement_val = dt_coulee_str if vide else dt_ecrasement_val
+                                        dt_c = datetime.strptime(date_coulee_correcte[:10], "%Y-%m-%d").date()
+                                        nouvelle_date_ecrasement = str(dt_c + timedelta(days=nb_j))
+                                        ep["date_ecrasement"] = nouvelle_date_ecrasement
+                                    except Exception:
+                                        nouvelle_date_ecrasement = ep.get("date_ecrasement")
 
-                                pay = {
-                                    "ref_controle": ref_ctrl,
-                                    "repere_eprouvette": str(r_m.get("repere_eprouvette", "")).strip(),
-                                    "echeance": ech_str,
-                                    "date_coulee": dt_coulee_str,
-                                    "date_ecrasement": dt_ecrasement_val,
-                                    "type_essai": str(r_m.get("type_essai", "") or "Compression").strip(),
-                                    "forme": str(r_m.get("forme", "") or "Cylindrique 150x300").strip(),
-                                }
-                                try:
-                                    orig_row_p1 = orig_par_id_p1.get(ep_id, {})
-                                    supabase.table("suivi_controle_beton").update(pay).eq("id", ep_id).execute()
-                                    enregistrer_modification(
-                                        supabase,
-                                        table_concernee="suivi_controle_beton",
-                                        enregistrement_id=ep_id,
-                                        action="MODIFICATION",
-                                        anciennes_valeurs={k: orig_row_p1.get(k) for k in pay},
-                                        nouvelles_valeurs=pay,
-                                        commentaire="Ajustement de programmation (Phase 1)",
-                                    )
-                                    if b_id:
-                                        try: supabase.table("suivi_betonnage").update({"num_reception": ref_ctrl}).eq("id", b_id).execute()
-                                        except Exception: pass
-                                    nb_succes += 1
-                                except Exception as err:
-                                    st.error(f"Erreur pour #{ep_id} : {err}")
-                            if nb_succes > 0:
-                                st.success(f"✅ {nb_succes} programmation(s) mise(s) à jour avec recalcul automatique de la date d'écrasement !")
-                                st.rerun()
+                                    try:
+                                        supabase.table("suivi_controle_beton").update({
+                                            "date_coulee": date_coulee_correcte,
+                                            "date_ecrasement": nouvelle_date_ecrasement
+                                        }).eq("id", ep["id"]).execute()
+                                        dates_corrigees_count += 1
+                                    except Exception:
+                                        pass
 
-                    st.markdown("---")
-                    st.markdown("##### 🗑️ Supprimer une ou plusieurs éprouvettes programmées par erreur")
-                    st.caption(
-                        "Utile si tu as saisi le mauvais nombre d'éprouvettes lors de la"
-                        " programmation (ex : 12 attendues, mais des éprouvettes en trop"
-                        " ont été ajoutées par erreur)."
-                    )
+                        if dates_corrigees_count > 0:
+                            st.success(f"🔄 **Synchronisation effectuée** : {dates_corrigees_count} date(s) de coulée réalignée(s) sur la Phase 0 !")
 
-                    lots_pour_suppression = {}
-                    for ep in eprouvettes_enregistrees:
-                        cle_lot_suppr = (
-                            f"{ep.get('ref_controle', '-')} — {ep.get('ouvrage', '-')}"
-                            f" (Lot #{ep.get('betonnage_id')})"
+                        df_edit_prog = pd.DataFrame(eprouvettes_enregistrees)
+                        cols_ed = [c for c in ["id", "betonnage_id", "ref_controle", "repere_eprouvette", "echeance", "date_ecrasement", "date_coulee", "ouvrage", "classe_beton", "type_essai", "forme"] if c in df_edit_prog.columns]
+                        df_display_prog = df_edit_prog[cols_ed].copy()
+                        if "type_essai" in df_display_prog.columns:
+                            df_display_prog["type_essai"] = df_display_prog["type_essai"].fillna("Compression")
+
+                        # NB : le tableau reçoit TOUJOURS les données brutes de la base (jamais
+                        # modifiées pendant la saisie). Modifier les données passées à st.data_editor
+                        # fait réinitialiser le tableau et annule les changements de l'utilisateur
+                        # (ex : 90 jours qui revient à 28 jours). Le recalcul de la date d'écrasement
+                        # se fait donc au moment de l'enregistrement.
+                        st.caption(
+                            "💡 Si vous changez l'**Échéance Visée**, la **Date Écrasement Prévue** est"
+                            " recalculée automatiquement (Date Coulée + Échéance) à l'enregistrement,"
+                            " sauf si vous modifiez cette date vous-même."
                         )
-                        lots_pour_suppression.setdefault(cle_lot_suppr, []).append(ep)
 
-                    labels_lots_suppr = [
-                        f"{cle} — {len(eps)} éprouvette(s)"
-                        for cle, eps in lots_pour_suppression.items()
-                    ]
-                    mapping_label_vers_cle_lot = dict(
-                        zip(labels_lots_suppr, lots_pour_suppression.keys())
-                    )
-
-                    lot_choisi_suppr = st.selectbox(
-                        "1️⃣ Choisir le lot",
-                        options=labels_lots_suppr,
-                        key="select_lot_suppr_prog",
-                    )
-                    eprouvettes_du_lot_suppr = lots_pour_suppression.get(
-                        mapping_label_vers_cle_lot.get(lot_choisi_suppr), []
-                    )
-
-                    options_suppr = {
-                        f"#{ep['id']} — {ep.get('repere_eprouvette', '-')}"
-                        f" ({ep.get('echeance', '-')}, prévu le {ep.get('date_ecrasement', '-')})": ep["id"]
-                        for ep in eprouvettes_du_lot_suppr
-                    }
-                    choix_suppr = st.multiselect(
-                        "2️⃣ Choisir la ou les éprouvette(s) à supprimer dans ce lot",
-                        options=list(options_suppr.keys()),
-                        key="multiselect_suppr_prog",
-                    )
-                    if choix_suppr:
-                        st.warning(
-                            f"⚠️ {len(choix_suppr)} éprouvette(s) sélectionnée(s) pour"
-                            " suppression **définitive**. Cette action est irréversible."
+                        df_prog_modifiee = st.data_editor(
+                            df_display_prog,
+                            column_config={
+                                "id": st.column_config.NumberColumn("ID", disabled=True),
+                                "betonnage_id": None,
+                                "ref_controle": st.column_config.TextColumn("Réf. Contrôle (N° Réception)"),
+                                "echeance": st.column_config.SelectboxColumn("Échéance Visée", options=["3 jours", "7 jours", "28 jours", "90 jours"]),
+                                "date_coulee": st.column_config.TextColumn("Date Coulée"),
+                                "date_ecrasement": st.column_config.TextColumn(
+                                    "Date Écrasement Prévue",
+                                    help="Calculée automatiquement = Date Coulée + Échéance"
+                                         " Visée, mais modifiable directement si besoin (ex :"
+                                         " décalage logistique, jour férié). Une valeur saisie"
+                                         " ici manuellement est conservée telle quelle tant que"
+                                         " l'Échéance ou la Date Coulée de cette ligne ne"
+                                         " changent pas à leur tour.",
+                                ),
+                                "ouvrage": st.column_config.TextColumn("Ouvrage", disabled=True),
+                                "classe_beton": st.column_config.TextColumn("Classe Béton", disabled=True),
+                                "type_essai": st.column_config.SelectboxColumn(
+                                    "🧪 Type d'essai",
+                                    options=["Compression", "Traction par fendage"],
+                                    help="Détermine la formule utilisée pour calculer la"
+                                         " résistance à la saisie des résultats.",
+                                ),
+                                "forme": st.column_config.SelectboxColumn(
+                                    "Forme d'éprouvette",
+                                    options=["Cylindrique 150x300", "Cylindrique 160x320", "Cylindrique 100x200"],
+                                ),
+                            },
+                            use_container_width=True, hide_index=True, key="editor_modification_phase1",
                         )
-                        confirmer_suppr = st.checkbox(
-                            "Je confirme vouloir supprimer définitivement ces éprouvettes",
-                            key="confirm_suppr_prog",
+
+                        if st.button("💾 Enregistrer les Modifications de Programmation", type="primary", use_container_width=True, key="btn_save_mod_prog"):
+                            bloque_mod = False
+                            for _, r_m in df_prog_modifiee.iterrows():
+                                ref_ctrl = str(r_m.get("ref_controle", "")).strip()
+                                if ref_ctrl and verifier_doublon_num_reception(supabase, ref_ctrl, current_beton_id=r_m.get("betonnage_id"), projet_id=projet_id_actif):
+                                    st.error(f"❌ **Modification Bloquée** : La Réf `{ref_ctrl}` existe déjà !")
+                                    bloque_mod = True
+                                    break
+
+                            if not bloque_mod:
+                                orig_par_id_p1 = {ep["id"]: ep for ep in eprouvettes_enregistrees}
+                                nb_succes = 0
+                                for _, r_m in df_prog_modifiee.iterrows():
+                                    ep_id, b_id = int(r_m["id"]), r_m.get("betonnage_id")
+                                    ref_ctrl = str(r_m.get("ref_controle", "")).strip()
+                                    ech_str = str(r_m.get("echeance", "")).strip()
+                                    dt_coulee_str = str(r_m.get("date_coulee", "")).strip()
+
+                                    # Recalcul de la date d'écrasement : si l'utilisateur n'a PAS
+                                    # modifié lui-même la date, mais a changé l'échéance (ou la date
+                                    # de coulée), on la recalcule = Date Coulée + Échéance.
+                                    # Si l'utilisateur a saisi une date à la main, on la conserve.
+                                    orig_ligne = orig_par_id_p1.get(ep_id, {})
+                                    ech_orig = str(orig_ligne.get("echeance") or "").strip()
+                                    coulee_orig = str(orig_ligne.get("date_coulee") or "").strip()
+                                    ecras_orig = str(orig_ligne.get("date_ecrasement") or "").strip()
+                                    dt_ecrasement_val = str(r_m.get("date_ecrasement", "") or "").strip()
+                                    date_saisie_manuellement = dt_ecrasement_val != ecras_orig
+                                    vide = (not dt_ecrasement_val) or dt_ecrasement_val.lower() in ["none", "nan", "-", "nat"]
+                                    if vide or (not date_saisie_manuellement and (ech_str != ech_orig or dt_coulee_str != coulee_orig)):
+                                        nb_j = extraire_nb_jours(ech_str, default=28)
+                                        try:
+                                            dt_c = datetime.strptime(dt_coulee_str[:10], "%Y-%m-%d").date()
+                                            dt_ecrasement_val = str(dt_c + timedelta(days=nb_j))
+                                        except (ValueError, TypeError):
+                                            dt_ecrasement_val = dt_coulee_str if vide else dt_ecrasement_val
+
+                                    pay = {
+                                        "ref_controle": ref_ctrl,
+                                        "repere_eprouvette": str(r_m.get("repere_eprouvette", "")).strip(),
+                                        "echeance": ech_str,
+                                        "date_coulee": dt_coulee_str,
+                                        "date_ecrasement": dt_ecrasement_val,
+                                        "type_essai": str(r_m.get("type_essai", "") or "Compression").strip(),
+                                        "forme": str(r_m.get("forme", "") or "Cylindrique 150x300").strip(),
+                                    }
+                                    try:
+                                        orig_row_p1 = orig_par_id_p1.get(ep_id, {})
+                                        supabase.table("suivi_controle_beton").update(pay).eq("id", ep_id).execute()
+                                        enregistrer_modification(
+                                            supabase,
+                                            table_concernee="suivi_controle_beton",
+                                            enregistrement_id=ep_id,
+                                            action="MODIFICATION",
+                                            anciennes_valeurs={k: orig_row_p1.get(k) for k in pay},
+                                            nouvelles_valeurs=pay,
+                                            commentaire="Ajustement de programmation (Phase 1)",
+                                        )
+                                        if b_id:
+                                            try: supabase.table("suivi_betonnage").update({"num_reception": ref_ctrl}).eq("id", b_id).execute()
+                                            except Exception: pass
+                                        nb_succes += 1
+                                    except Exception as err:
+                                        st.error(f"Erreur pour #{ep_id} : {err}")
+                                if nb_succes > 0:
+                                    st.success(f"✅ {nb_succes} programmation(s) mise(s) à jour avec recalcul automatique de la date d'écrasement !")
+                                    st.rerun()
+
+                        st.markdown("---")
+                        st.markdown("##### 🗑️ Supprimer une ou plusieurs éprouvettes programmées par erreur")
+                        st.caption(
+                            "Utile si tu as saisi le mauvais nombre d'éprouvettes lors de la"
+                            " programmation (ex : 12 attendues, mais des éprouvettes en trop"
+                            " ont été ajoutées par erreur)."
                         )
-                        if st.button(
-                            "🗑️ Supprimer les éprouvettes sélectionnées",
-                            type="primary",
-                            disabled=not confirmer_suppr,
-                            key="btn_suppr_prog",
-                        ):
-                            orig_par_id_suppr = {ep["id"]: ep for ep in eprouvettes_enregistrees}
-                            nb_suppr = 0
-                            for label in choix_suppr:
-                                ep_id_suppr = options_suppr[label]
-                                try:
-                                    ep_avant_suppr = orig_par_id_suppr.get(ep_id_suppr, {})
-                                    supabase.table("suivi_controle_beton").delete().eq("id", ep_id_suppr).execute()
-                                    enregistrer_modification(
-                                        supabase,
-                                        table_concernee="suivi_controle_beton",
-                                        enregistrement_id=ep_id_suppr,
-                                        action="SUPPRESSION",
-                                        anciennes_valeurs={k: v for k, v in ep_avant_suppr.items() if k != "id"},
-                                        commentaire="Suppression d'une éprouvette programmée par erreur (Phase 1)",
-                                    )
-                                    nb_suppr += 1
-                                except Exception as err_suppr:
-                                    st.error(f"Erreur lors de la suppression de {label} : {err_suppr}")
-                            if nb_suppr > 0:
-                                st.success(f"✅ {nb_suppr} éprouvette(s) supprimée(s).")
-                                st.rerun()
+
+                        lots_pour_suppression = {}
+                        for ep in eprouvettes_enregistrees:
+                            cle_lot_suppr = (
+                                f"{ep.get('ref_controle', '-')} — {ep.get('ouvrage', '-')}"
+                                f" (Lot #{ep.get('betonnage_id')})"
+                            )
+                            lots_pour_suppression.setdefault(cle_lot_suppr, []).append(ep)
+
+                        labels_lots_suppr = [
+                            f"{cle} — {len(eps)} éprouvette(s)"
+                            for cle, eps in lots_pour_suppression.items()
+                        ]
+                        mapping_label_vers_cle_lot = dict(
+                            zip(labels_lots_suppr, lots_pour_suppression.keys())
+                        )
+
+                        lot_choisi_suppr = st.selectbox(
+                            "1️⃣ Choisir le lot",
+                            options=labels_lots_suppr,
+                            key="select_lot_suppr_prog",
+                        )
+                        eprouvettes_du_lot_suppr = lots_pour_suppression.get(
+                            mapping_label_vers_cle_lot.get(lot_choisi_suppr), []
+                        )
+
+                        options_suppr = {
+                            f"#{ep['id']} — {ep.get('repere_eprouvette', '-')}"
+                            f" ({ep.get('echeance', '-')}, prévu le {ep.get('date_ecrasement', '-')})": ep["id"]
+                            for ep in eprouvettes_du_lot_suppr
+                        }
+                        choix_suppr = st.multiselect(
+                            "2️⃣ Choisir la ou les éprouvette(s) à supprimer dans ce lot",
+                            options=list(options_suppr.keys()),
+                            key="multiselect_suppr_prog",
+                        )
+                        if choix_suppr:
+                            st.warning(
+                                f"⚠️ {len(choix_suppr)} éprouvette(s) sélectionnée(s) pour"
+                                " suppression **définitive**. Cette action est irréversible."
+                            )
+                            confirmer_suppr = st.checkbox(
+                                "Je confirme vouloir supprimer définitivement ces éprouvettes",
+                                key="confirm_suppr_prog",
+                            )
+                            if st.button(
+                                "🗑️ Supprimer les éprouvettes sélectionnées",
+                                type="primary",
+                                disabled=not confirmer_suppr,
+                                key="btn_suppr_prog",
+                            ):
+                                orig_par_id_suppr = {ep["id"]: ep for ep in eprouvettes_enregistrees}
+                                nb_suppr = 0
+                                for label in choix_suppr:
+                                    ep_id_suppr = options_suppr[label]
+                                    try:
+                                        ep_avant_suppr = orig_par_id_suppr.get(ep_id_suppr, {})
+                                        supabase.table("suivi_controle_beton").delete().eq("id", ep_id_suppr).execute()
+                                        enregistrer_modification(
+                                            supabase,
+                                            table_concernee="suivi_controle_beton",
+                                            enregistrement_id=ep_id_suppr,
+                                            action="SUPPRESSION",
+                                            anciennes_valeurs={k: v for k, v in ep_avant_suppr.items() if k != "id"},
+                                            commentaire="Suppression d'une éprouvette programmée par erreur (Phase 1)",
+                                        )
+                                        nb_suppr += 1
+                                    except Exception as err_suppr:
+                                        st.error(f"Erreur lors de la suppression de {label} : {err_suppr}")
+                                if nb_suppr > 0:
+                                    st.success(f"✅ {nb_suppr} éprouvette(s) supprimée(s).")
+                                    st.rerun()
 
             # --- Détection et nettoyage des doublons de programmation ---
             with st.expander("🧹 Détecter et supprimer les doublons de programmation", expanded=False):
@@ -1889,29 +1960,18 @@ def show(supabase):
         prog_counts = {}
         prog_counts_ref = {}   # filet de sécurité : comptage par N° de réception
         try:
-            PAGE_PROG = 1000
-            debut_prog = 0
-            while True:
-                res_deja = (
-                    supabase.table("suivi_controle_beton")
-                    .select("id, betonnage_id, ref_controle")
-                    .eq("projet_id", projet_id_actif)
-                    .order("id")
-                    .range(debut_prog, debut_prog + PAGE_PROG - 1)
-                    .execute()
-                )
-                lignes_prog = res_deja.data or []
-                for r in lignes_prog:
-                    b_id_v = r.get("betonnage_id")
-                    if b_id_v:
-                        prog_counts[b_id_v] = prog_counts.get(b_id_v, 0) + 1
-                    else:
-                        ref_v = str(r.get("ref_controle") or "").strip()
-                        if ref_v:
-                            prog_counts_ref[ref_v] = prog_counts_ref.get(ref_v, 0) + 1
-                if len(lignes_prog) < PAGE_PROG:
-                    break
-                debut_prog += PAGE_PROG
+            lignes_prog = lire_table_projet(
+                supabase, "suivi_controle_beton", projet_id_actif, _version_donnees()["v"],
+                colonnes="id, betonnage_id, ref_controle", desc=False,
+            )
+            for r in lignes_prog:
+                b_id_v = r.get("betonnage_id")
+                if b_id_v:
+                    prog_counts[b_id_v] = prog_counts.get(b_id_v, 0) + 1
+                else:
+                    ref_v = str(r.get("ref_controle") or "").strip()
+                    if ref_v:
+                        prog_counts_ref[ref_v] = prog_counts_ref.get(ref_v, 0) + 1
         except Exception as e:
             st.warning(f"Note lors du contrôle des quotas : {e}")
 
@@ -2111,8 +2171,7 @@ def show(supabase):
 
         try:
             if mode_admin:
-                res_att = fetch_all(lambda: supabase.table("suivi_controle_beton").select("*").eq("projet_id", projet_id_actif).order("id", desc=False))
-                eprouvettes_en_attente = res_att.data or []
+                eprouvettes_en_attente = lire_table_projet(supabase, "suivi_controle_beton", projet_id_actif, _version_donnees()["v"], desc=False) or []
             else:
                 res_att = (
                     supabase.table("suivi_controle_beton")
