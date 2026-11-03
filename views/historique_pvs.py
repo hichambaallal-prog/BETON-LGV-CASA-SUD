@@ -147,6 +147,86 @@ def trier_essais_pv(export_data, date_fab):
   )
 
 
+# Seuil (en %) d'écart à la médiane au-delà duquel une résistance est
+# considérée comme aberrante (appliqué seulement s'il y a >= 3 éprouvettes
+# écrasées pour la même échéance et le même type d'essai).
+SEUIL_ABERRANT_PCT = 15.0
+
+
+def _cle_echeance(item, date_fab):
+  """Clé de regroupement d'une éprouvette : (échéance en jours, fendage ?)."""
+  m = re.search(r"\d+", str(item.get("echeance") or ""))
+  jours = (
+      int(m.group())
+      if m
+      else calculer_age_jours(date_fab, item.get("date_essai"), item.get("age"))
+  )
+  return (jours, est_essai_fendage(item))
+
+
+def _est_ecrase(item):
+  try:
+    return float(item.get("force_kn", 0.0) or 0.0) > 0.0
+  except (ValueError, TypeError):
+    return False
+
+
+def preparer_essais_pv(export_data, date_fab):
+  """Prépare les lignes du PV :
+  1. tri par âge / type d'essai ;
+  2. pour une échéance où au moins une éprouvette a été écrasée, les
+     éprouvettes non écrasées sont retirées (le PV ne contient que ce qui a
+     réellement été écrasé : 2 éprouvettes -> 2 lignes, pas 3) ;
+  3. détection de la valeur aberrante (écart > SEUIL_ABERRANT_PCT % par
+     rapport à la médiane, pour >= 3 éprouvettes écrasées) : la ligne est
+     marquée ``_aberrant`` et sera exclue de la moyenne.
+  """
+  essais = [dict(it) for it in trier_essais_pv(export_data, date_fab)]
+
+  ecrases_par_cle = {}
+  for it in essais:
+    if _est_ecrase(it):
+      ecrases_par_cle.setdefault(_cle_echeance(it, date_fab), []).append(it)
+
+  essais = [
+      it for it in essais
+      if _est_ecrase(it) or _cle_echeance(it, date_fab) not in ecrases_par_cle
+  ]
+
+  for cle, groupe in ecrases_par_cle.items():
+    if len(groupe) < 3:
+      continue
+    vals = [float(it.get("fc_mpa", 0.0) or 0.0) for it in groupe]
+    tri = sorted(vals)
+    n = len(tri)
+    mediane = tri[n // 2] if n % 2 else (tri[n // 2 - 1] + tri[n // 2]) / 2
+    if mediane <= 0:
+      continue
+    ecarts = [abs(v - mediane) / mediane * 100.0 for v in vals]
+    i_max = max(range(n), key=lambda i: ecarts[i])
+    if ecarts[i_max] > SEUIL_ABERRANT_PCT:
+      groupe[i_max]["_aberrant"] = True
+      groupe[i_max]["_mediane"] = mediane
+      autres = [v for i, v in enumerate(vals) if i != i_max]
+      groupe[i_max]["_moyenne_retenue"] = round(sum(autres) / len(autres), 1)
+  return essais
+
+
+def commentaires_aberrants(essais):
+  """Phrases à ajouter au commentaire du PV pour chaque valeur aberrante."""
+  notes = []
+  for it in essais:
+    if it.get("_aberrant"):
+      notes.append(
+          f"Valeur aberrante : l'éprouvette {it.get('repere_eprouvette', '-')}"
+          f" ({float(it.get('fc_mpa', 0.0) or 0.0):.1f} MPa) s'écarte de plus de"
+          f" {SEUIL_ABERRANT_PCT:.0f} % de la médiane ({it['_mediane']:.1f} MPa)."
+          f" Elle est écartée du calcul de la moyenne"
+          f" ({it['_moyenne_retenue']:.1f} MPa retenue)."
+      )
+  return notes
+
+
 def nettoyer_nom_fichier(chaine):
   """Remplace les caractères interdits pour les noms de fichiers OS."""
   if not chaine:
@@ -338,7 +418,7 @@ def generer_pv_excel(export_data, infos_header):
 
   ligne_courante = 15
   groupes_lots = {}
-  export_data = trier_essais_pv(export_data, date_fab_header)
+  export_data = preparer_essais_pv(export_data, date_fab_header)
   for item in export_data:
     fend = est_essai_fendage(item)
     f_kn = float(item.get("force_kn", 0.0) or 0.0)
@@ -366,11 +446,14 @@ def generer_pv_excel(export_data, infos_header):
       set_cell(ligne_courante, col_val, "En cours")
     else:
       set_cell(ligne_courante, 5, f"{f_kn:.1f}")
-      set_cell(ligne_courante, col_val, f"{float(item.get('fc_mpa', 0.0) or 0.0):.1f}")
+      txt_fc = f"{float(item.get('fc_mpa', 0.0) or 0.0):.1f}"
+      set_cell(ligne_courante, col_val, txt_fc + (" *" if item.get("_aberrant") else ""))
     set_cell(ligne_courante, col_autre, "-")
 
     cle = f"{age_val}_{dt_essai}_{'T' if fend else 'C'}"
-    groupes_lots.setdefault(cle, {"lignes": [], "en_cours": is_en_cours, "age": age_val, "fend": fend})["lignes"].append(ligne_courante)
+    groupes_lots.setdefault(cle, {"lignes": [], "en_cours": is_en_cours, "age": age_val, "fend": fend, "aberrants": []})["lignes"].append(ligne_courante)
+    if item.get("_aberrant"):
+      groupes_lots[cle]["aberrants"].append(ligne_courante)
     ligne_courante += 1
 
   a_des_28j, moyenne_28j_val, est_en_cours_28j = False, None, False
@@ -384,6 +467,8 @@ def generer_pv_excel(export_data, infos_header):
     else:
       vals = []
       for li in lignes:
+        if li in gdata["aberrants"]:
+          continue  # valeur aberrante : exclue de la moyenne
         try:
           vals.append(float(ws.cell(row=li, column=7 if gdata["fend"] else 6).value))
         except (ValueError, TypeError):
@@ -417,10 +502,16 @@ def generer_pv_excel(export_data, infos_header):
   else:
     comment_valeur = "PERFORMANCES MECANIQUES NON CONFORMES"
 
+  notes_ab = commentaires_aberrants(export_data)
+  if notes_ab:
+    comment_valeur = "\n".join([comment_valeur] + notes_ab + ["(*) valeur aberrante, non retenue dans la moyenne."])
+
   row_comment = ligne_courante
   set_cell(row_comment, 1, "Commentaire :", bold=True, fill=LABEL_FILL, align="left")
   merge(row_comment, 2, row_comment, 8)
-  set_cell(row_comment, 2, comment_valeur, bold=True, align="left")
+  set_cell(row_comment, 2, comment_valeur, bold=True, align="left", wrap=True)
+  if notes_ab:
+    ws.row_dimensions[row_comment].height = 15 + 36 * len(notes_ab) + 12
 
   row_visa_titre = row_comment + 1
   merge(row_visa_titre, 2, row_visa_titre, 4)
@@ -733,7 +824,7 @@ def generer_pv_pdf(export_data, infos_header):
 
   row_indices_body = []
   groupes_lots = {}
-  export_data = trier_essais_pv(export_data, date_fab_header)
+  export_data = preparer_essais_pv(export_data, date_fab_header)
   for item in export_data:
     fend = est_essai_fendage(item)
     f_kn = float(item.get("force_kn", 0.0) or 0.0)
@@ -772,7 +863,9 @@ def generer_pv_pdf(export_data, infos_header):
       r[i_val] = "En cours"
     else:
       r[4] = f"{f_kn:.1f}"
-      r[i_val] = f"{float(item.get('fc_mpa', 0.0) or 0.0):.1f}"
+      r[i_val] = f"{float(item.get('fc_mpa', 0.0) or 0.0):.1f}" + (
+          " *" if item.get("_aberrant") else ""
+      )
     r[i_autre] = "-"
     data.append(r)
     r_idx = len(data) - 1
@@ -781,8 +874,11 @@ def generer_pv_pdf(export_data, infos_header):
 
     cle = f"{age_val}_{dt_essai}_{'T' if fend else 'C'}"
     groupes_lots.setdefault(
-        cle, {"lignes": [], "en_cours": is_en_cours, "age": age_val, "fend": fend}
+        cle,
+        {"lignes": [], "en_cours": is_en_cours, "age": age_val, "fend": fend, "aberrants": []},
     )["lignes"].append(r_idx)
+    if item.get("_aberrant"):
+      groupes_lots[cle]["aberrants"].append(r_idx)
 
   a_des_28j, moyenne_28j_val, est_en_cours_28j = False, None, False
   for gdata in groupes_lots.values():
@@ -795,6 +891,8 @@ def generer_pv_pdf(export_data, infos_header):
     else:
       vals = []
       for li in lignes:
+        if li in gdata["aberrants"]:
+          continue  # valeur aberrante : exclue de la moyenne
         try:
           vals.append(float(data[li][6 if gdata["fend"] else 5]))
         except (ValueError, TypeError):
@@ -840,6 +938,12 @@ def generer_pv_pdf(export_data, infos_header):
     comment_valeur = "PERFORMANCES MECANIQUES A 28 JOURS SONT CONFORMES"
   else:
     comment_valeur = "PERFORMANCES MECANIQUES NON CONFORMES"
+
+  notes_ab = commentaires_aberrants(export_data)
+  if notes_ab:
+    comment_valeur = "<br/>".join(
+        [comment_valeur] + notes_ab + ["(*) valeur aberrante, non retenue dans la moyenne."]
+    )
 
   r = blank_row()
   r[0] = "Commentaire :"
@@ -1311,6 +1415,7 @@ def show(supabase):
               "force_kn": f_kn,
               "fc_mpa": fc,
               "date_essai": dt_essai_item,
+              "echeance": item.get("echeance"),
               "age": age_real,
               "statut": "En cours" if f_kn == 0 else "Réalisé",
           })
