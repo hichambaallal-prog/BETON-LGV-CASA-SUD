@@ -2454,6 +2454,17 @@ def show(supabase):
                 df_actuel = st.session_state[lot_key]
 
                 st.markdown("---")
+                # Lot partiellement écrasé (ex. 2 éprouvettes sur 3) : on peut
+                # enregistrer seulement celles qui ont été écrasées ; les autres
+                # sont retirées du lot et ne figurent donc pas au PV.
+                nb_non_ecrasees = int((df_actuel["Force (kN)"].astype(float) == 0).sum())
+                retirer_non_ecrasees = False
+                if 0 < nb_non_ecrasees < len(df_actuel):
+                    retirer_non_ecrasees = st.checkbox(
+                        f"✂️ Seules {len(df_actuel) - nb_non_ecrasees} éprouvette(s) ont été écrasées : "
+                        f"retirer les {nb_non_ecrasees} autre(s) du lot (elles ne figureront pas au PV)",
+                        key=f"chk_retirer_non_ecrasees_{lot_key}",
+                    )
                 btn_enregistrer = st.button(
                     "💾 Valider et Mettre à Jour Le Lot" if mode_admin else "💾 Valider et Enregistrer Le Lot",
                     type="primary",
@@ -2461,15 +2472,41 @@ def show(supabase):
                 )
 
                 if btn_enregistrer:
-                    if (df_actuel["Force (kN)"].astype(float) == 0).any() and not mode_admin:
-                        st.error("❌ Les forces de rupture doivent toutes être saisies (> 0 kN).")
+                    if nb_non_ecrasees == len(df_actuel) and not mode_admin:
+                        st.error("❌ Saisissez au moins une force de rupture (> 0 kN).")
+                    elif 0 < nb_non_ecrasees and not retirer_non_ecrasees and not mode_admin:
+                        st.error(
+                            "❌ Certaines forces sont à 0 kN. Saisissez-les, ou cochez la case "
+                            "« retirer les éprouvettes non écrasées » si elles n'ont pas été écrasées."
+                        )
                     else:
                         succes_lot = 0
+                        nb_retirees = 0
                         ref_finale = df_actuel.iloc[0].get("🏷️ Référence de Contrôle")
                         try: supabase.table("suivi_betonnage").update({"ref_controle": ref_finale}).eq("id", betonnage_id).execute()
                         except Exception: pass
 
                         for _, row in df_actuel.iterrows():
+                            if retirer_non_ecrasees and float(row["Force (kN)"]) == 0:
+                                try:
+                                    ep_id_sup = int(row["ID"])
+                                    enregistrer_modification(
+                                        supabase,
+                                        table_concernee="suivi_controle_beton",
+                                        enregistrement_id=ep_id_sup,
+                                        action="SUPPRESSION",
+                                        anciennes_valeurs={
+                                            "repere_eprouvette": row.get("_repere_orig"),
+                                            "ref_controle": row.get("_ref_orig"),
+                                            "force_kn": 0.0,
+                                        },
+                                        commentaire=f"Éprouvette non écrasée retirée du lot — opérateur : {tech_global}",
+                                    )
+                                    supabase.table("suivi_controle_beton").delete().eq("id", ep_id_sup).execute()
+                                    nb_retirees += 1
+                                except Exception as e:
+                                    st.error(f"Erreur lors du retrait de l'éprouvette {row['Repère']} : {e}")
+                                continue
                             upd = {
                                 "ref_controle": row.get("🏷️ Référence de Contrôle"), "repere_eprouvette": row.get("Repère"),
                                 "force_kn": float(row["Force (kN)"]), "fc_mpa": float(row["Résistance Fc (MPa)"]),
@@ -2500,9 +2537,12 @@ def show(supabase):
                             except Exception as e:
                                 st.error(f"Erreur sur l'éprouvette {row['Repère']} : {e}")
 
-                        if succes_lot == len(df_actuel):
+                        if succes_lot + nb_retirees == len(df_actuel):
                             st.balloons()
-                            st.success(f"✅ Lot de {succes_lot} éprouvettes mis à jour / validé !")
+                            msg_retrait = f" ({nb_retirees} éprouvette(s) non écrasée(s) retirée(s) du lot)" if nb_retirees else ""
+                            st.success(f"✅ Lot de {succes_lot} éprouvettes mis à jour / validé !{msg_retrait}")
+                            if nb_retirees:
+                                st.session_state.pop(lot_key, None)
 
                 if is_baallal_admin:
                     with st.expander("🕓 Historique des modifications de ce lot (traçabilité ISO 17025)"):
