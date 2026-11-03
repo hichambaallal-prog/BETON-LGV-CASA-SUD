@@ -2462,7 +2462,8 @@ def show(supabase):
                 if 0 < nb_non_ecrasees < len(df_actuel):
                     retirer_non_ecrasees = st.checkbox(
                         f"✂️ Seules {len(df_actuel) - nb_non_ecrasees} éprouvette(s) ont été écrasées : "
-                        f"retirer les {nb_non_ecrasees} autre(s) du lot (elles ne figureront pas au PV)",
+                        f"supprimer définitivement les {nb_non_ecrasees} autre(s) du lot. "
+                        f"(Laissez décoché pour les garder en attente et les saisir plus tard.)",
                         key=f"chk_retirer_non_ecrasees_{lot_key}",
                     )
                 btn_enregistrer = st.button(
@@ -2474,14 +2475,10 @@ def show(supabase):
                 if btn_enregistrer:
                     if nb_non_ecrasees == len(df_actuel) and not mode_admin:
                         st.error("❌ Saisissez au moins une force de rupture (> 0 kN).")
-                    elif 0 < nb_non_ecrasees and not retirer_non_ecrasees and not mode_admin:
-                        st.error(
-                            "❌ Certaines forces sont à 0 kN. Saisissez-les, ou cochez la case "
-                            "« retirer les éprouvettes non écrasées » si elles n'ont pas été écrasées."
-                        )
                     else:
                         succes_lot = 0
                         nb_retirees = 0
+                        nb_laissees_en_attente = 0
                         ref_finale = df_actuel.iloc[0].get("🏷️ Référence de Contrôle")
                         try: supabase.table("suivi_betonnage").update({"ref_controle": ref_finale}).eq("id", betonnage_id).execute()
                         except Exception: pass
@@ -2506,6 +2503,11 @@ def show(supabase):
                                     nb_retirees += 1
                                 except Exception as e:
                                     st.error(f"Erreur lors du retrait de l'éprouvette {row['Repère']} : {e}")
+                                continue
+                            # Éprouvette non encore écrasée : on ne touche pas à la ligne,
+                            # elle reste "en attente" et pourra être saisie plus tard.
+                            if float(row["Force (kN)"]) == 0 and not mode_admin:
+                                nb_laissees_en_attente += 1
                                 continue
                             upd = {
                                 "ref_controle": row.get("🏷️ Référence de Contrôle"), "repere_eprouvette": row.get("Repère"),
@@ -2537,11 +2539,12 @@ def show(supabase):
                             except Exception as e:
                                 st.error(f"Erreur sur l'éprouvette {row['Repère']} : {e}")
 
-                        if succes_lot + nb_retirees == len(df_actuel):
+                        if succes_lot + nb_retirees + nb_laissees_en_attente == len(df_actuel):
                             st.balloons()
                             msg_retrait = f" ({nb_retirees} éprouvette(s) non écrasée(s) retirée(s) du lot)" if nb_retirees else ""
-                            st.success(f"✅ Lot de {succes_lot} éprouvettes mis à jour / validé !{msg_retrait}")
-                            if nb_retirees:
+                            msg_attente = f" ({nb_laissees_en_attente} éprouvette(s) restent en attente de saisie)" if nb_laissees_en_attente else ""
+                            st.success(f"✅ {succes_lot} éprouvette(s) enregistrée(s) !{msg_retrait}{msg_attente}")
+                            if nb_retirees or nb_laissees_en_attente:
                                 st.session_state.pop(lot_key, None)
 
                 if is_baallal_admin:
